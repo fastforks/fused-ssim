@@ -80,10 +80,13 @@ __global__ void fusedssimCUDA(
     float* __restrict__ dm_dmu1,
     float* __restrict__ dm_dsigma1_sq,
     float* __restrict__ dm_dsigma12,
-    bool nhwc
+    bool nhwc,
+    float* __restrict__ map_sum,  // if set: accumulate the SSIM sum over the valid region instead of writing ssim_map
+    int pad                       // valid-region margin (5 for padding="valid", 0 for "same")
 ) {
     auto block = cg::this_thread_block();
     const int bIdx   = block.group_index().z;  // batch index
+    float local_sum  = 0.f;
     const int pix_y  = block.group_index().y * BLOCK_Y + block.thread_index().y;
     const int pix_x  = block.group_index().x * BLOCK_X + block.thread_index().x;
     const int pix_id = pix_y * W + pix_x;
@@ -267,7 +270,12 @@ __global__ void fusedssimCUDA(
                 val = fmaxf(-1.0f, fminf(1.0f, val));
 
                 int global_idx = pix_index(bIdx, c, pix_y, pix_x, CH, H, W, nhwc);
-                ssim_map[global_idx] = val;
+                if (map_sum) {
+                    if (pix_y >= pad && pix_y < H - pad && pix_x >= pad && pix_x < W - pad)
+                        local_sum += val;
+                } else {
+                    ssim_map[global_idx] = val;
+                }
 
                 if (dm_dmu1) {
                     // partial derivatives (zero if clamped)
@@ -285,6 +293,20 @@ __global__ void fusedssimCUDA(
                     dm_dsigma12[global_idx]   = d_m_dsigma12;
                 }
             }
+        }
+    }
+    if (map_sum) {
+        // Block reduction of the valid-region SSIM sum, one atomic per block.
+        __shared__ float warp_sums[(BLOCK_X * BLOCK_Y + 31) / 32];
+        const int tid = block.thread_rank();
+        for (int off = 16; off > 0; off >>= 1)
+            local_sum += __shfl_down_sync(0xffffffffu, local_sum, off);
+        if ((tid & 31) == 0) warp_sums[tid >> 5] = local_sum;
+        block.sync();
+        if (tid == 0) {
+            float total = 0.f;
+            for (int w = 0; w < (BLOCK_X * BLOCK_Y + 31) / 32; ++w) total += warp_sums[w];
+            atomicAdd(map_sum, total);
         }
     }
 }
@@ -308,7 +330,10 @@ __global__ void fusedssim_backwardCUDA(
     const float* __restrict__ dm_dmu1,
     const float* __restrict__ dm_dsigma1_sq,
     const float* __restrict__ dm_dsigma12,
-    bool nhwc
+    bool nhwc,
+    const float* __restrict__ dL_dmean, // if set: dL/dmap = *dL_dmean / count inside the valid region, 0 outside
+    float count,
+    int pad
 ) {
     auto block = cg::this_thread_block();
 
@@ -346,7 +371,14 @@ __global__ void fusedssim_backwardCUDA(
                 for (int col = lane_id; col < SHARED_X; col += 32) {
                     int gx = start_x + col - HALO;
 
-                    float chain = get_pix_value(dL_dmap,      bIdx, c, gy, gx, CH, H, W, nhwc);
+                    float chain;
+                    if (dL_dmean) {
+                        // mean backward: grad / numel over the valid region (zero padding outside)
+                        chain = (gy >= pad && gy < H - pad && gx >= pad && gx < W - pad)
+                                    ? __fdiv_rn(*dL_dmean, count) : 0.0f;
+                    } else {
+                        chain = get_pix_value(dL_dmap, bIdx, c, gy, gx, CH, H, W, nhwc);
+                    }
                     float vmu   = get_pix_value(dm_dmu1,      bIdx, c, gy, gx, CH, H, W, nhwc);
                     float vs1   = get_pix_value(dm_dsigma1_sq,bIdx, c, gy, gx, CH, H, W, nhwc);
                     float vs12  = get_pix_value(dm_dsigma12,  bIdx, c, gy, gx, CH, H, W, nhwc);
@@ -486,10 +518,40 @@ fusedssim(
         train ? dm_dmu1.data_ptr<float>()       : nullptr,
         train ? dm_dsigma1_sq.data_ptr<float>() : nullptr,
         train ? dm_dsigma12.data_ptr<float>()   : nullptr,
-        nhwc
+        nhwc,
+        nullptr,
+        0
     );
 
     return std::make_tuple(ssim_map, dm_dmu1, dm_dsigma1_sq, dm_dsigma12);
+}
+
+// Mean SSIM over the valid region (margin `pad`) without materializing the map.
+// Returns (map_sum [1], dm_dmu1, dm_dsigma1_sq, dm_dsigma12).
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+fusedssim_sum(float C1, float C2, torch::Tensor &img1, torch::Tensor &img2, bool train, int pad)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(img1));
+    int B  = img1.size(0);
+    int CH = img1.size(1);
+    int H  = img1.size(2);
+    int W  = img1.size(3);
+    dim3 grid((W + BLOCK_X - 1) / BLOCK_X, (H + BLOCK_Y - 1) / BLOCK_Y, B);
+    dim3 block(BLOCK_X, BLOCK_Y);
+    const bool nhwc = img1.dim() == 4 && !img1.is_contiguous()
+                      && img1.is_contiguous(at::MemoryFormat::ChannelsLast);
+    const auto fmt  = nhwc ? at::MemoryFormat::ChannelsLast : at::MemoryFormat::Contiguous;
+    auto i1 = img1.contiguous(fmt);
+    auto i2 = img2.contiguous(fmt);
+    auto map_sum       = torch::zeros({1}, img1.options());
+    auto dm_dmu1       = train ? torch::empty_like(i1, fmt) : torch::empty({0}, img1.options());
+    auto dm_dsigma1_sq = train ? torch::empty_like(i1, fmt) : torch::empty({0}, img1.options());
+    auto dm_dsigma12   = train ? torch::empty_like(i1, fmt) : torch::empty({0}, img1.options());
+    fusedssimCUDA<<<grid, block>>>(
+        H, W, CH, C1, C2, i1.data_ptr<float>(), i2.data_ptr<float>(), nullptr,
+        train ? dm_dmu1.data_ptr<float>() : nullptr, train ? dm_dsigma1_sq.data_ptr<float>() : nullptr,
+        train ? dm_dsigma12.data_ptr<float>() : nullptr, nhwc, map_sum.data_ptr<float>(), pad);
+    return std::make_tuple(map_sum, dm_dmu1, dm_dsigma1_sq, dm_dsigma12);
 }
 
 // ------------------------------------------
@@ -534,8 +596,40 @@ fusedssim_backward(
         dm_dmu1.contiguous(fmt).data_ptr<float>(),
         dm_dsigma1_sq.contiguous(fmt).data_ptr<float>(),
         dm_dsigma12.contiguous(fmt).data_ptr<float>(),
-        nhwc
+        nhwc,
+        nullptr,
+        0.f,
+        0
     );
 
+    return dL_dimg1;
+}
+
+// Backward of fusedssim_sum(...) / count: dL/dmap = *dL_dmean / count on the
+// valid region; dL_dmean is a device scalar (no host sync).
+torch::Tensor
+fusedssim_backward_mean(
+    float C1, float C2, torch::Tensor &img1, torch::Tensor &img2, torch::Tensor &dL_dmean, double count, int pad,
+    torch::Tensor &dm_dmu1, torch::Tensor &dm_dsigma1_sq, torch::Tensor &dm_dsigma12)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(img1));
+    int B  = img1.size(0);
+    int CH = img1.size(1);
+    int H  = img1.size(2);
+    int W  = img1.size(3);
+    const bool nhwc = img1.dim() == 4 && !img1.is_contiguous()
+                      && img1.is_contiguous(at::MemoryFormat::ChannelsLast);
+    const auto fmt  = nhwc ? at::MemoryFormat::ChannelsLast : at::MemoryFormat::Contiguous;
+    auto dL_dimg1   = torch::empty_like(img1, fmt);
+    auto g          = dL_dmean.to(torch::kFloat).contiguous();
+    dim3 grid((W + BLOCK_X - 1) / BLOCK_X, (H + BLOCK_Y - 1) / BLOCK_Y, B);
+    dim3 block(BLOCK_X, BLOCK_Y);
+    fusedssim_backwardCUDA<<<grid, block>>>(
+        H, W, CH, C1, C2,
+        img1.contiguous(fmt).data_ptr<float>(), img2.contiguous(fmt).data_ptr<float>(),
+        nullptr, dL_dimg1.data_ptr<float>(),
+        dm_dmu1.contiguous(fmt).data_ptr<float>(), dm_dsigma1_sq.contiguous(fmt).data_ptr<float>(),
+        dm_dsigma12.contiguous(fmt).data_ptr<float>(), nhwc,
+        g.data_ptr<float>(), static_cast<float>(count), pad);
     return dL_dimg1;
 }
