@@ -76,7 +76,7 @@ class FusedSSIMMean(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, C1, C2, img1, img2, pad):
-        map_sum, dm_dmu1, dm_dsigma1_sq, dm_dsigma12 = fusedssim_sum(C1, C2, img1, img2, True, pad)
+        map_sum, dm_dmu1, dm_dsigma1_sq, dm_dsigma12 = fusedssim_sum(C1, C2, img1, img2, True, pad, False)
         B, CH, H, W = img1.shape
         count = B * CH * (H - 2 * pad) * (W - 2 * pad)
         ctx.save_for_backward(img1.detach(), img2, dm_dmu1, dm_dsigma1_sq, dm_dsigma12)
@@ -87,8 +87,44 @@ class FusedSSIMMean(torch.autograd.Function):
     def backward(ctx, grad):
         img1, img2, dm_dmu1, dm_dsigma1_sq, dm_dsigma12 = ctx.saved_tensors
         dimg1 = fusedssim_backward_mean(ctx.C1, ctx.C2, img1, img2, grad.reshape(1), float(ctx.count), ctx.pad,
-                                        dm_dmu1, dm_dsigma1_sq, dm_dsigma12)
+                                        dm_dmu1, dm_dsigma1_sq, dm_dsigma12, None, 0.0)
         return None, None, dimg1, None, None
+
+
+class FusedL1SSIMMean(torch.autograd.Function):
+    """(mean |img1 - img2|, mean SSIM over the valid region) in one pass; the
+    backward adds both image gradients inside the SSIM backward kernel."""
+
+    @staticmethod
+    def forward(ctx, C1, C2, img1, img2, pad):
+        sums, dm_dmu1, dm_dsigma1_sq, dm_dsigma12 = fusedssim_sum(C1, C2, img1, img2, True, pad, True)
+        B, CH, H, W = img1.shape
+        count = B * CH * (H - 2 * pad) * (W - 2 * pad)
+        ctx.save_for_backward(img1.detach(), img2, dm_dmu1, dm_dsigma1_sq, dm_dsigma12)
+        ctx.C1, ctx.C2, ctx.pad, ctx.count, ctx.l1_count = C1, C2, pad, count, img1.numel()
+        return sums[1] / img1.numel(), sums[0] / count
+
+    @staticmethod
+    def backward(ctx, g_l1, g_ssim):
+        img1, img2, dm_dmu1, dm_dsigma1_sq, dm_dsigma12 = ctx.saved_tensors
+        if g_ssim is None:
+            g_ssim = torch.zeros((), device=img1.device)
+        dimg1 = fusedssim_backward_mean(ctx.C1, ctx.C2, img1, img2, g_ssim.reshape(1), float(ctx.count), ctx.pad,
+                                        dm_dmu1, dm_dsigma1_sq, dm_dsigma12,
+                                        None if g_l1 is None else g_l1.reshape(1), float(ctx.l1_count))
+        return None, None, dimg1, None, None
+
+
+def fused_l1_ssim(img1, img2, padding="valid"):
+    """Returns (mean L1, mean SSIM) of NCHW (or channels-last) images, matching
+    F.l1_loss(img1, img2).mean() and fused_ssim(img1, img2, padding) with
+    bitwise-equal gradients (values differ only in summation order)."""
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+    assert padding in allowed_padding
+    if not img1.is_contiguous(memory_format=torch.channels_last):
+        img1 = img1.contiguous()
+    return FusedL1SSIMMean.apply(C1, C2, img1, img2, 5 if padding == "valid" else 0)
 
 
 def fused_ssim(img1, img2, padding="same", train=True):
