@@ -1,3 +1,23 @@
+# fused-ssim: training-path fork
+
+> **You are on `cuda-kernels`.** Research fork of [rahul-goel/fused-ssim](https://github.com/rahul-goel/fused-ssim) (base `a7c48d6`, 2026-02-02; `main` mirrors upstream), used by [fastforks/gsplat](https://github.com/fastforks/gsplat). The changes are CUDA only and cover the 2D path; Metal, ROCm, SYCL and 3D are unchanged.
+> - `fused_ssim(img1, img2)` reads channels-last inputs in place, without NHWC/NCHW copies, and skips the zero-fills of outputs the kernels overwrite. Results are bitwise identical.
+> - With `train=True` and a CUDA input that requires grad, `fused_ssim` computes the mean in the kernel, so the SSIM map is never stored. Gradients are bitwise identical; the value differs only in summation order (~1e-9).
+> - New: `l1, ssim = fused_l1_ssim(img1, img2, padding="valid")` gives the mean L1 and the mean SSIM in one pass, with one backward. Gradients are bitwise equal to `F.l1_loss` + `fused_ssim`; the values differ only in summation order.
+> Licence, as upstream: MIT ([LICENSE](LICENSE)), Copyright (c) Rahul Goel; our changes are under the same licence.
+
+L1 + SSIM loss, forward + backward, 1x840x1297x3 channels-last (a garden /4 render vs its target, as in gsplat's `simple_trainer.py`), RTX 5060 Ti 16 GB, torch 2.14.1+cu130, 2026-10-12, median of 200 after 20 warm-up (median of 2 processes):
+
+| version | ms | speed-up | peak MB alloc / reserved |
+|---|---|---|---|
+| upstream `a7c48d6`: `F.l1_loss` + `fused_ssim` | 1.39 | 1.00x | 149 / 170 |
+| fork: `F.l1_loss` + `fused_ssim` | 0.93 | 1.49x | 99 / 114 |
+| fork: `fused_l1_ssim` | 0.63 | 2.19x | 87 / 114 |
+
+All three rows give the same loss (0.4651853; 0.4651854 for `fused_l1_ssim`, summation order) and the same gradient (sum of |grad| 1.1958014 in each row).
+
+---
+
 # Fully Fused Differentiable SSIM
 
 This repository contains an efficient fully-fused implementation of [SSIM](https://en.wikipedia.org/wiki/Structural_similarity_index_measure) which is differentiable in nature. There are several factors that contribute to an efficient implementation:
