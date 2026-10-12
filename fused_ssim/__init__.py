@@ -78,7 +78,7 @@ class FusedSSIMMean(torch.autograd.Function):
     def forward(ctx, C1, C2, img1, img2, pad):
         map_sum, dm_dmu1, dm_dsigma1_sq, dm_dsigma12 = fusedssim_sum(C1, C2, img1, img2, True, pad, False)
         B, CH, H, W = img1.shape
-        count = B * CH * (H - 2 * pad) * (W - 2 * pad)
+        count = B * CH * max(H - 2 * pad, 0) * max(W - 2 * pad, 0)
         ctx.save_for_backward(img1.detach(), img2, dm_dmu1, dm_dsigma1_sq, dm_dsigma12)
         ctx.C1, ctx.C2, ctx.pad, ctx.count = C1, C2, pad, count
         return (map_sum / count).squeeze(0)
@@ -99,7 +99,7 @@ class FusedL1SSIMMean(torch.autograd.Function):
     def forward(ctx, C1, C2, img1, img2, pad):
         sums, dm_dmu1, dm_dsigma1_sq, dm_dsigma12 = fusedssim_sum(C1, C2, img1, img2, True, pad, True)
         B, CH, H, W = img1.shape
-        count = B * CH * (H - 2 * pad) * (W - 2 * pad)
+        count = B * CH * max(H - 2 * pad, 0) * max(W - 2 * pad, 0)
         ctx.save_for_backward(img1.detach(), img2, dm_dmu1, dm_dsigma1_sq, dm_dsigma12)
         ctx.C1, ctx.C2, ctx.pad, ctx.count, ctx.l1_count = C1, C2, pad, count, img1.numel()
         return sums[1] / img1.numel(), sums[0] / count
@@ -118,12 +118,24 @@ class FusedL1SSIMMean(torch.autograd.Function):
 def fused_l1_ssim(img1, img2, padding="valid"):
     """Returns (mean L1, mean SSIM) of NCHW (or channels-last) images, matching
     F.l1_loss(img1, img2).mean() and fused_ssim(img1, img2, padding) with
-    bitwise-equal gradients (values differ only in summation order)."""
+    matching image gradients for a fixed upstream loss gradient (within fp32
+    rounding; reduction order can change the scalar value). Only img1 is
+    differentiable; img2 must be a fixed target. CUDA/HIP 2D inputs only."""
     C1 = 0.01 ** 2
     C2 = 0.03 ** 2
     assert padding in allowed_padding
     if not img1.is_contiguous(memory_format=torch.channels_last):
         img1 = img1.contiguous()
+    if not img1.is_cuda:
+        raise ValueError("fused_l1_ssim requires CUDA/HIP inputs")
+    if img1.device != img2.device or img1.dtype != torch.float32 or img2.dtype != torch.float32:
+        raise ValueError("fused_l1_ssim requires float32 inputs on the same CUDA/HIP device")
+    if img1.ndim != 4 or img1.shape != img2.shape:
+        raise ValueError("fused_l1_ssim requires matching 4D image shapes")
+    if img2.requires_grad:
+        raise ValueError("fused_l1_ssim requires a fixed target (img2.requires_grad=False)")
+    if torch.are_deterministic_algorithms_enabled():
+        return torch.nn.functional.l1_loss(img1, img2), fused_ssim(img1, img2, padding)
     return FusedL1SSIMMean.apply(C1, C2, img1, img2, 5 if padding == "valid" else 0)
 
 
@@ -133,13 +145,15 @@ def fused_ssim(img1, img2, padding="same", train=True):
 
     assert padding in allowed_padding
 
-    if train and img1.is_cuda and img1.requires_grad and torch.cuda.is_available():
+    if (train and img1.is_cuda and img1.requires_grad and torch.cuda.is_available()
+            and not torch.are_deterministic_algorithms_enabled()):
         if not img1.is_contiguous(memory_format=torch.channels_last):
             img1 = img1.contiguous()
         return FusedSSIMMean.apply(C1, C2, img1, img2, 5 if padding == "valid" else 0)
 
-    # Channels-last (e.g. a permuted NHWC render) is handled without a copy.
-    if not img1.is_contiguous(memory_format=torch.channels_last):
+    # Only the CUDA/HIP kernels support channels-last output buffers.
+    # Metal and SYCL still write contiguous NCHW gradients.
+    if not img1.is_cuda or not img1.is_contiguous(memory_format=torch.channels_last):
         img1 = img1.contiguous()
     map = FusedSSIMMap.apply(C1, C2, img1, img2, padding, train, 2)
     return map.mean()

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <iostream>
 #include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
 
 namespace cg = cooperative_groups;
 
@@ -530,7 +531,7 @@ fusedssim(
     auto dm_dsigma1_sq = train ? torch::empty_like(i1, fmt) : torch::empty({0}, img1.options());
     auto dm_dsigma12   = train ? torch::empty_like(i1, fmt) : torch::empty({0}, img1.options());
 
-    fusedssimCUDA<<<grid, block>>>(
+    fusedssimCUDA<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
         H, W, CH, C1, C2,
         i1.data_ptr<float>(),
         i2.data_ptr<float>(),
@@ -568,7 +569,7 @@ fusedssim_sum(float C1, float C2, torch::Tensor &img1, torch::Tensor &img2, bool
     auto dm_dmu1       = train ? torch::empty_like(i1, fmt) : torch::empty({0}, img1.options());
     auto dm_dsigma1_sq = train ? torch::empty_like(i1, fmt) : torch::empty({0}, img1.options());
     auto dm_dsigma12   = train ? torch::empty_like(i1, fmt) : torch::empty({0}, img1.options());
-    fusedssimCUDA<<<grid, block>>>(
+    fusedssimCUDA<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
         H, W, CH, C1, C2, i1.data_ptr<float>(), i2.data_ptr<float>(), nullptr,
         train ? dm_dmu1.data_ptr<float>() : nullptr, train ? dm_dsigma1_sq.data_ptr<float>() : nullptr,
         train ? dm_dsigma12.data_ptr<float>() : nullptr, nhwc, map_sum.data_ptr<float>(), pad,
@@ -609,7 +610,7 @@ fusedssim_backward(
               B);
     dim3 block(BLOCK_X, BLOCK_Y);
 
-    fusedssim_backwardCUDA<<<grid, block>>>(
+    fusedssim_backwardCUDA<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
         H, W, CH, C1, C2,
         img1.contiguous(fmt).data_ptr<float>(),
         img2.contiguous(fmt).data_ptr<float>(),
@@ -650,7 +651,7 @@ fusedssim_backward_mean(
     auto g1         = dL_dl1.has_value() ? dL_dl1.value().to(torch::kFloat).contiguous() : g;
     dim3 grid((W + BLOCK_X - 1) / BLOCK_X, (H + BLOCK_Y - 1) / BLOCK_Y, B);
     dim3 block(BLOCK_X, BLOCK_Y);
-    fusedssim_backwardCUDA<<<grid, block>>>(
+    fusedssim_backwardCUDA<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
         H, W, CH, C1, C2,
         img1.contiguous(fmt).data_ptr<float>(), img2.contiguous(fmt).data_ptr<float>(),
         nullptr, dL_dimg1.data_ptr<float>(),
